@@ -1,17 +1,24 @@
-# Custom PostgreSQL image with schema pre-baked.
-# Upgraded to postgres:16-alpine (Alpine 3.23, active support).
-# postgres:15-alpine had patchable CRITICAL vulnerabilities in Alpine packages.
-FROM postgres:16-alpine
+# ──────────────────────────────────────────────────────────────────────────────
+# PostgreSQL database image with application schema pre-baked.
+#
+# Base image: postgres:16.12-alpine
+#   - postgres:16-alpine (floating tag) shipped postgresql16 < 16.12-r0
+#     which contains CVE-2026-2005 (heap buffer overflow in pgcrypto, CRITICAL)
+#   - postgres:16.12-alpine pins to PostgreSQL 16.12, which ships
+#     postgresql16 >= 16.12-r0 on Alpine 3.23 — the CVE is patched here.
+#   - Fixed in: postgresql16-16.12-r0 (Alpine OSV ALPINE-CVE-2026-2005)
+# ──────────────────────────────────────────────────────────────────────────────
+FROM postgres:16.12-alpine
 
 LABEL org.opencontainers.image.title="microservices-database"
-LABEL org.opencontainers.image.description="PostgreSQL 16 with application schema"
+LABEL org.opencontainers.image.description="PostgreSQL 16.12 with application schema"
 
-# Apply all available Alpine security patches at build time.
-# This ensures any CVEs fixed after the base image was published are included.
+# Upgrade all Alpine packages to pick up any security patches released
+# after the base image was last published.
 RUN apk update && apk upgrade --no-cache && rm -rf /var/cache/apk/*
 
-# Copy initialisation scripts into the official hook directory.
-# PostgreSQL runs *.sql files here on first start (alphabetical order).
+# Copy initialisation scripts.
+# PostgreSQL runs *.sql files in /docker-entrypoint-initdb.d/ on first start.
 COPY init.sql /docker-entrypoint-initdb.d/01-init.sql
 
 EXPOSE 5432
