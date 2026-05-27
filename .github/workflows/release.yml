@@ -2,16 +2,13 @@
 # Release Workflow — Build · Scan · Push · Package · Publish
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Trivy scanning strategy (fixes the "exit 1 with ignore-unfixed" action bug):
-#
-#   The official trivy-action@master ignores --ignore-unfixed when producing
-#   SARIF output — it always scans all severities and exits 1 on any match.
-#   Fix: install Trivy via aquasecurity/setup-trivy and run CLI directly so
-#   every flag (--ignore-unfixed, --exit-code, --severity) is fully respected.
+# Trivy strategy — direct CLI via setup-trivy (NOT trivy-action wrapper):
+#   trivy-action silently strips --ignore-unfixed for SARIF, causing false
+#   exit-1 on Alpine unfixed CVEs. Direct CLI fully respects all flags.
 #
 # Per-image flow:
-#   Build (load, no push) → table scan → SARIF scan → JSON scan
-#   → upload SARIF → upload JSON artifact → fail gate → push to GHCR
+#   Build (load, no push) → install trivy → table → SARIF → JSON
+#   → upload SARIF → upload JSON → fail gate → push to GHCR
 #
 # NO deployment is performed.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29,7 +26,7 @@ concurrency:
 permissions:
   contents:        write   # upload release assets
   packages:        write   # push to GHCR
-  security-events: write   # upload Trivy SARIF to GitHub Security tab
+  security-events: write   # upload Trivy SARIF
   id-token:        write   # OIDC (future cosign signing)
 
 env:
@@ -65,18 +62,6 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 2 — build-scan-push  (matrix: frontend / backend / database)
-  #
-  # Per-service sequence:
-  #   a) Build image → load into docker daemon (NOT pushed yet)
-  #   b) Install Trivy CLI via setup-trivy
-  #   c) Table scan  → logs, exit 0, informational
-  #   d) SARIF scan  → trivy CLI directly, exit 1 on CRITICAL+FIXED only
-  #                    (ignore-unfixed is respected because we use CLI, not action)
-  #   e) JSON scan   → all severities, saved as artifact + bundled in ZIP
-  #   f) Upload SARIF → GitHub Security tab
-  #   g) Upload JSON  → workflow artifact
-  #   h) Fail gate   → re-raises failure after SARIF upload completes
-  #   i) Push to GHCR → only reached if scan passed
   # ────────────────────────────────────────────────────────────────────────────
   build-scan-push:
     name: 🐳 Build · 🔍 Scan · 📤 Push — ${{ matrix.service }}
@@ -147,12 +132,10 @@ jobs:
           provenance: false
 
       # ── 6. Install Trivy CLI ───────────────────────────────────────────────
-      #   Using setup-trivy + direct CLI invocation instead of trivy-action.
-      #   The trivy-action wrapper ignores --ignore-unfixed for SARIF output,
-      #   causing exit 1 on unfixable Alpine CVEs. Running trivy directly
-      #   fixes this because all CLI flags are fully respected.
+      #   Pinned to commit SHA (v0.2.6) for security and reproducibility.
+      #   Ref: https://github.com/aquasecurity/setup-trivy/releases/tag/v0.2.6
       - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.2.2
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
         with:
           version: v0.70.0
 
@@ -168,10 +151,10 @@ jobs:
             --ignorefile .trivyignore \
             ${{ matrix.service }}:scan-target
 
-      # ── 7b. SARIF scan — CLI directly, blocks on CRITICAL+FIXED only ──────
-      #   --ignore-unfixed: CVEs with no available patch are skipped
+      # ── 7b. SARIF scan — blocks on CRITICAL+FIXED only ────────────────────
+      #   --ignore-unfixed: skip CVEs with no available patch
       #   --exit-code 1:    fail only when a patchable CRITICAL exists
-      #   continue-on-error: allows steps 7c, 8, 9 to run even on failure
+      #   continue-on-error: allows SARIF upload to run even on failure
       - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL+fixed only)"
         id: trivy-sarif
         run: |
@@ -184,9 +167,9 @@ jobs:
             --severity CRITICAL \
             --ignorefile .trivyignore \
             ${{ matrix.service }}:scan-target
-        continue-on-error: true   # upload SARIF even if scan failed
+        continue-on-error: true
 
-      # ── 7c. JSON scan — full report, all severities, always runs ──────────
+      # ── 7c. JSON scan — full report, all severities ───────────────────────
       - name: "🔍 Trivy JSON — ${{ matrix.service }} (all severities)"
         if: always()
         run: |
@@ -216,14 +199,13 @@ jobs:
           path:           trivy-${{ matrix.service }}.json
           retention-days: 30
 
-      # ── 10. Explicit fail gate ─────────────────────────────────────────────
-      #   Re-raise the failure AFTER SARIF is uploaded so findings are always
-      #   visible in Security tab regardless of whether the job fails.
+      # ── 10. Fail gate ──────────────────────────────────────────────────────
+      #   Re-raise failure AFTER SARIF upload so findings appear in Security tab
       - name: "❌ Fail if patchable CRITICAL vulnerabilities found"
         if: steps.trivy-sarif.outcome == 'failure'
         run: |
           echo "❌ Trivy found patchable CRITICAL vulnerabilities in ${{ matrix.service }}."
-          echo "   Fix: update the base image or the vulnerable package, then re-publish the release."
+          echo "   Fix: update the base image or vulnerable package, then re-publish."
           echo "   Details: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
           exit 1
 
@@ -242,7 +224,6 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 3 — trivy-summary
-  # Download all JSON reports and publish a consolidated summary table.
   # ────────────────────────────────────────────────────────────────────────────
   trivy-summary:
     name: 📊 Trivy Scan Summary
@@ -265,7 +246,6 @@ jobs:
             echo ""
             echo "| Service | CRITICAL | HIGH | MEDIUM | LOW | Status |"
             echo "|---------|----------|------|--------|-----|--------|"
-
             for SERVICE in frontend backend database; do
               REPORT="trivy-${SERVICE}.json"
               if [ -f "$REPORT" ]; then
@@ -273,7 +253,6 @@ jobs:
                 HIGH=$(jq     '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' "$REPORT" 2>/dev/null || echo 0)
                 MEDIUM=$(jq   '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")]   | length' "$REPORT" 2>/dev/null || echo 0)
                 LOW=$(jq      '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")]      | length' "$REPORT" 2>/dev/null || echo 0)
-
                 if   [ "${CRITICAL}" -gt 0 ]; then STATUS="❌ BLOCKED"
                 elif [ "${HIGH}"     -gt 0 ]; then STATUS="⚠️ WARNING"
                 else                               STATUS="✅ PASSED"
@@ -283,16 +262,15 @@ jobs:
                 echo "| \`${SERVICE}\` | — | — | — | — | ⏭️ No report |"
               fi
             done
-
             echo ""
-            echo "> **Policy:** Blocks on CRITICAL+FIXED only. Unfixed CVEs (no patch available) are ignored."
-            echo "> Full reports available as workflow artifacts (30-day retention)."
+            echo "> **Policy:** Blocks on CRITICAL+FIXED only. Unfixed CVEs are ignored."
             echo "> Findings: **[Security → Code scanning](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)**"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 4 — package-release
-  # Bundle source + scan reports into a ZIP and upload to the Release.
+  # Fix: ZIP_NAME and ZIP_PATH written to GITHUB_OUTPUT (not GITHUB_ENV) so
+  # they are accessible across steps reliably.
   # ────────────────────────────────────────────────────────────────────────────
   package-release:
     name: 📦 Package Release Asset
@@ -339,7 +317,6 @@ jobs:
 
           cat > release/docker-compose.prod.yml <<EOF
           # Production compose — images pulled from GHCR with pinned version tags
-          # Usage: export DB_PASSWORD=secret && docker compose -f docker-compose.prod.yml up -d
           version: "3.9"
           services:
             database:
@@ -356,7 +333,6 @@ jobs:
                 timeout:  5s
                 retries:  5
               networks: [ms-network]
-
             backend:
               image: ${REGISTRY}/${OWNER}/backend:${VERSION}
               restart: unless-stopped
@@ -373,28 +349,30 @@ jobs:
                   condition: service_healthy
               ports: ["3000:3000"]
               networks: [ms-network]
-
             frontend:
               image: ${REGISTRY}/${OWNER}/frontend:${VERSION}
               restart: unless-stopped
               ports: ["8080:80"]
               depends_on: [backend]
               networks: [ms-network]
-
           volumes:
             db-data:
           networks:
             ms-network:
           EOF
 
+      # Fix for "Context access might be invalid: ZIP_PATH / ZIP_NAME":
+      # Write to GITHUB_OUTPUT with a step id, then reference via steps.<id>.outputs.<name>
       - name: Create release ZIP
+        id: zip
         run: |
           VERSION="${{ needs.extract-version.outputs.version }}"
           ZIP_NAME="release-${VERSION}.zip"
+          ZIP_PATH="$(pwd)/${ZIP_NAME}"
           zip -r "$ZIP_NAME" release/
-          echo "ZIP_NAME=$ZIP_NAME"        >> "$GITHUB_ENV"
-          echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> "$GITHUB_ENV"
-          echo "📦 $ZIP_NAME — $(du -sh "$ZIP_NAME" | cut -f1)"
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
+          echo "📦 ${ZIP_NAME} — $(du -sh "$ZIP_NAME" | cut -f1)"
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
@@ -402,13 +380,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url:         ${{ github.event.release.upload_url }}
-          asset_path:         ${{ env.ZIP_PATH }}
-          asset_name:         ${{ env.ZIP_NAME }}
+          asset_path:         ${{ steps.zip.outputs.zip_path }}
+          asset_name:         ${{ steps.zip.outputs.zip_name }}
           asset_content_type: application/zip
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 5 — release-notes
-  # Update GitHub Release body + write workflow summary.
   # ────────────────────────────────────────────────────────────────────────────
   release-notes:
     name: 📝 Publish Release Notes & Summary
@@ -446,15 +423,14 @@ jobs:
 
             ### 🔍 Security Scan (Trivy)
 
-            All images scanned with **Trivy** before being pushed to GHCR.
+            All images scanned before being pushed to GHCR.
             Full findings: [Security → Code scanning](${secUrl})
-            JSON reports are bundled in \`release/security/\` inside the ZIP.
 
             | Policy | Action |
             |--------|--------|
-            | CRITICAL + patch available | ❌ Blocks release — image not pushed |
-            | CRITICAL + no patch (unfixed) | ⚠️ Reported, does not block |
-            | HIGH / MEDIUM / LOW | ⚠️ Reported, does not block |
+            | CRITICAL + patch available | ❌ Blocks release |
+            | CRITICAL + no patch (unfixed) | ⚠️ Reported only |
+            | HIGH / MEDIUM / LOW | ⚠️ Reported only |
 
             ---
 
@@ -470,21 +446,16 @@ jobs:
             ${pullCmds}
             \`\`\`
 
-            ### 📦 Release Asset
-
-            Download **\`${zipName}\`** from Assets below.
+            ### 📦 Release Asset — \`${zipName}\`
 
             \`\`\`
             release/
             ├── frontend/
             ├── backend/
             ├── database/
-            ├── security/                    ← Trivy JSON reports
-            │   ├── trivy-frontend.json
-            │   ├── trivy-backend.json
-            │   └── trivy-database.json
-            ├── docker-compose.yml           ← Local dev (build from source)
-            ├── docker-compose.prod.yml      ← Production (pull from GHCR)
+            ├── security/           ← Trivy JSON reports
+            ├── docker-compose.yml
+            ├── docker-compose.prod.yml
             ├── README.md
             └── VERSION
             \`\`\`
@@ -509,7 +480,6 @@ jobs:
           OWNER="${{ env.IMAGE_OWNER }}"
           REGISTRY="${{ env.REGISTRY }}"
           {
-            echo "---"
             echo "## ✅ Release ${VERSION} — Published Successfully"
             echo ""
             echo "| Property | Value |"
@@ -517,8 +487,6 @@ jobs:
             echo "| Version | \`${VERSION}\` |"
             echo "| Commit  | \`${{ github.sha }}\` |"
             echo "| Asset   | \`release-${VERSION}.zip\` |"
-            echo ""
-            echo "## 🐳 Docker Images"
             echo ""
             echo "| Service  | Image |"
             echo "|----------|-------|"
