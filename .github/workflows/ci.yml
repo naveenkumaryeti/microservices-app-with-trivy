@@ -1,16 +1,20 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# CI Workflow — Build Validation + Trivy Scan on Pull Requests / main pushes
+# CI Workflow — Build Validation + Trivy Scan on PRs / main pushes
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Two Trivy scans per image:
-#   1. Table scan  — human-readable log, never blocks, shows CRITICAL+HIGH+MEDIUM
-#   2. SARIF scan  — uploaded to Security tab
-#                    exit-code 1 ONLY on CRITICAL+FIXED (unfixed ignored)
-#                    continue-on-error: false → blocks PR merge on real CRITICALs
+# Trivy scanning strategy (fixes the "exit 1 with ignore-unfixed" action bug):
 #
-# Fix for "exit 1 with zero CRITICAL" false-positive:
-#   The SARIF scan uses --ignore-unfixed so vendor-reported unfixed CVEs
-#   (common in alpine images) do not cause a spurious failure.
+#   The official trivy-action@master ignores --ignore-unfixed when producing
+#   SARIF output — it always scans all severities and exits 1 on any match.
+#   Fix: install Trivy via aquasecurity/setup-trivy and run CLI directly so
+#   every flag (--ignore-unfixed, --exit-code, --severity) is fully respected.
+#
+# Per-image scan flow:
+#   1. Table scan  → human-readable log, exit 0 always (informational)
+#   2. SARIF scan  → trivy CLI directly, exit 1 ONLY on CRITICAL+FIXED
+#   3. JSON scan   → full report, all severities, saved as artifact
+#   4. Upload SARIF → GitHub Security tab (if: always())
+#   5. Fail gate   → re-raises failure after SARIF upload completes
 # ══════════════════════════════════════════════════════════════════════════════
 
 name: CI — Build & Security Scan
@@ -27,19 +31,16 @@ concurrency:
 
 permissions:
   contents:        read
-  security-events: write   # upload SARIF to GitHub Security tab
+  security-events: write   # required to upload SARIF to GitHub Security tab
 
 jobs:
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Build each service image and run Trivy scan (no push)
-  # ────────────────────────────────────────────────────────────────────────────
   build-and-scan:
     name: 🔨 Build & 🔍 Scan — ${{ matrix.service }}
     runs-on: ubuntu-latest
 
     strategy:
-      fail-fast: false
+      fail-fast: false        # show failures for all services, not just the first
       matrix:
         include:
           - service:    frontend
@@ -61,7 +62,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── 3. Build locally (load into daemon for Trivy) ─────────────────────
+      # ── 3. Build locally (loaded into daemon for Trivy) ───────────────────
       - name: Build ${{ matrix.service }} (no push)
         uses: docker/build-push-action@v5
         with:
@@ -73,61 +74,85 @@ jobs:
           cache-from: type=gha,scope=ci-${{ matrix.service }}
           cache-to:   type=gha,mode=max,scope=ci-${{ matrix.service }}
 
-      # ── 4a. Trivy table scan — logs only, never blocks ────────────────────
-      - name: "🔍 Trivy — ${{ matrix.service }} table (CRITICAL+HIGH+MEDIUM)"
-        uses: aquasecurity/trivy-action@master
+      # ── 4. Install Trivy CLI directly ──────────────────────────────────────
+      #   Using setup-trivy instead of trivy-action gives us full CLI control,
+      #   which is the only reliable way to honour --ignore-unfixed with SARIF.
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.2
         with:
-          image-ref:      "${{ matrix.service }}:ci"
-          format:         table
-          exit-code:      "0"           # informational only
-          ignore-unfixed: true          # skip CVEs with no available patch
-          vuln-type:      "os,library"
-          severity:       "CRITICAL,HIGH,MEDIUM"
-          trivyignores:   ".trivyignore"
+          version: v0.70.0
 
-      # ── 4b. Trivy SARIF scan — uploaded to Security tab ───────────────────
-      #   exit-code 1  → blocks only on CRITICAL+FIXED vulnerabilities.
-      #   ignore-unfixed: true → alpine vendor-reported unfixed CVEs won't
-      #   fail the build (the root cause of the spurious exit-1 errors).
-      - name: "🔍 Trivy — ${{ matrix.service }} SARIF (CRITICAL fixed only)"
+      # ── 5a. Table scan — informational, never blocks ───────────────────────
+      - name: "🔍 Trivy table — ${{ matrix.service }}"
+        run: |
+          trivy image \
+            --format table \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --ignorefile .trivyignore \
+            ${{ matrix.service }}:ci
+
+      # ── 5b. SARIF scan — CLI directly, respects all flags ─────────────────
+      #   --ignore-unfixed: skip CVEs with no available fix
+      #   --exit-code 1:    fail only when patchable CRITICALs are found
+      #   Running CLI directly (not trivy-action) fixes the SARIF+unfixed bug.
+      - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL+fixed only)"
         id: trivy-sarif
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref:      "${{ matrix.service }}:ci"
-          format:         sarif
-          output:         "trivy-${{ matrix.service }}-ci.sarif"
-          exit-code:      "1"           # fail if CRITICAL+FIXED CVEs exist
-          ignore-unfixed: true          # ← KEY FIX: unfixed = no patch = skip
-          vuln-type:      "os,library"
-          severity:       "CRITICAL"
-          trivyignores:   ".trivyignore"
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-${{ matrix.service }}-ci.sarif \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --severity CRITICAL \
+            --ignorefile .trivyignore \
+            ${{ matrix.service }}:ci
+        continue-on-error: true   # let upload-sarif run even if this fails
 
-      # ── 4c. Upload SARIF — runs even if scan step failed ──────────────────
-      #   'if: always()' ensures the SARIF file is uploaded whether or not
-      #   the scan passed, so findings are always visible in the Security tab.
-      - name: Upload SARIF to GitHub Security tab
+      # ── 5c. JSON scan — full report for artifact download ─────────────────
+      - name: "🔍 Trivy JSON — ${{ matrix.service }} (all severities)"
+        if: always()
+        run: |
+          trivy image \
+            --format json \
+            --output trivy-${{ matrix.service }}.json \
+            --exit-code 0 \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --ignorefile .trivyignore \
+            ${{ matrix.service }}:ci
+
+      # ── 6. Upload SARIF to GitHub Security tab ─────────────────────────────
+      - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: "trivy-${{ matrix.service }}-ci.sarif"
-          category:   "ci-trivy-${{ matrix.service }}"
+          sarif_file: trivy-${{ matrix.service }}-ci.sarif
+          category:   ci-trivy-${{ matrix.service }}
 
-      # ── 4d. Explicit failure gate ─────────────────────────────────────────
-      #   If the SARIF scan (step 4b) found CRITICAL+FIXED vulns and set
-      #   exit-code 1, this step re-raises the failure AFTER the SARIF upload
-      #   completes. Without this, 'if: always()' on upload would mask the
-      #   original failure and the job would show green.
-      - name: Fail if CRITICAL vulnerabilities found
+      # ── 7. Upload JSON report as workflow artifact ─────────────────────────
+      - name: Upload Trivy JSON artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name:           trivy-ci-${{ matrix.service }}
+          path:           trivy-${{ matrix.service }}.json
+          retention-days: 14
+
+      # ── 8. Fail gate — re-raise after SARIF is safely uploaded ────────────
+      #   Without this, continue-on-error on step 5b would mark the job green.
+      - name: "❌ Fail if CRITICAL+fixed vulnerabilities found"
         if: steps.trivy-sarif.outcome == 'failure'
         run: |
-          echo "❌ Trivy found CRITICAL vulnerabilities in ${{ matrix.service }}."
-          echo "   Check the Security tab for details:"
-          echo "   ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
+          echo "❌ Trivy found patchable CRITICAL vulnerabilities in ${{ matrix.service }}."
+          echo "   Fix: update the base image or the affected package, then re-push."
+          echo "   Details: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
           exit 1
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Validate docker-compose syntax
-  # ────────────────────────────────────────────────────────────────────────────
+  # ── Validate docker-compose syntax ────────────────────────────────────────
   validate-compose:
     name: ✅ Validate docker-compose.yml
     runs-on: ubuntu-latest

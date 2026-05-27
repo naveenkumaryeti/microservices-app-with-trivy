@@ -2,19 +2,16 @@
 # Release Workflow — Build · Scan · Push · Package · Publish
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Triggers on every GitHub Release publication.
-# Responsibilities (ONLY):
-#   1. Extract version from the release tag (e.g. v1.0.0)
-#   2. Build Docker images for frontend / backend / database
-#   3. Trivy vulnerability scan each image BEFORE pushing
-#      • Table  → printed in logs (informational)
-#      • SARIF  → uploaded to GitHub Security tab
-#      • JSON   → saved as workflow artifact + bundled in release ZIP
-#      • BLOCKS on CRITICAL+FIXED vulnerabilities only
-#   4. Push images to GHCR (only if scan passes)
-#   5. Publish consolidated Trivy summary table
-#   6. Bundle release ZIP and upload as Release Asset
-#   7. Generate release notes + workflow summary
+# Trivy scanning strategy (fixes the "exit 1 with ignore-unfixed" action bug):
+#
+#   The official trivy-action@master ignores --ignore-unfixed when producing
+#   SARIF output — it always scans all severities and exits 1 on any match.
+#   Fix: install Trivy via aquasecurity/setup-trivy and run CLI directly so
+#   every flag (--ignore-unfixed, --exit-code, --severity) is fully respected.
+#
+# Per-image flow:
+#   Build (load, no push) → table scan → SARIF scan → JSON scan
+#   → upload SARIF → upload JSON artifact → fail gate → push to GHCR
 #
 # NO deployment is performed.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -58,14 +55,12 @@ jobs:
         id: parse
         run: |
           TAG="${{ github.ref_name }}"
-
           if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "❌ Tag '$TAG' does not match vX.Y.Z format" >&2
             exit 1
           fi
-
-          echo "version=${TAG}"    >> "$GITHUB_OUTPUT"
-          echo "plain=${TAG#v}"    >> "$GITHUB_OUTPUT"
+          echo "version=${TAG}"  >> "$GITHUB_OUTPUT"
+          echo "plain=${TAG#v}"  >> "$GITHUB_OUTPUT"
           echo "✅ Release version: ${TAG}"
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -73,13 +68,15 @@ jobs:
   #
   # Per-service sequence:
   #   a) Build image → load into docker daemon (NOT pushed yet)
-  #   b) Trivy table scan  → logs, exit-code 0, informational
-  #   c) Trivy SARIF scan  → exit-code 1 on CRITICAL+FIXED only
-  #                          (ignore-unfixed prevents alpine false-positives)
-  #   d) Upload SARIF      → GitHub Security tab  (if: always())
-  #   e) Trivy JSON scan   → saved as artifact    (if: always())
-  #   f) Fail gate         → re-raises failure after SARIF upload completes
-  #   g) Push to GHCR      → only reached if scan passed
+  #   b) Install Trivy CLI via setup-trivy
+  #   c) Table scan  → logs, exit 0, informational
+  #   d) SARIF scan  → trivy CLI directly, exit 1 on CRITICAL+FIXED only
+  #                    (ignore-unfixed is respected because we use CLI, not action)
+  #   e) JSON scan   → all severities, saved as artifact + bundled in ZIP
+  #   f) Upload SARIF → GitHub Security tab
+  #   g) Upload JSON  → workflow artifact
+  #   h) Fail gate   → re-raises failure after SARIF upload completes
+  #   i) Push to GHCR → only reached if scan passed
   # ────────────────────────────────────────────────────────────────────────────
   build-scan-push:
     name: 🐳 Build · 🔍 Scan · 📤 Push — ${{ matrix.service }}
@@ -135,7 +132,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      # ── 5. Build locally — load into daemon, DO NOT push yet ──────────────
+      # ── 5. Build locally — load into daemon, do NOT push yet ──────────────
       - name: Build ${{ matrix.service }} (local — pre-scan)
         uses: docker/build-push-action@v5
         with:
@@ -149,77 +146,88 @@ jobs:
           cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
           provenance: false
 
-      # ── 6a. Trivy table scan — informational, never blocks ─────────────────
+      # ── 6. Install Trivy CLI ───────────────────────────────────────────────
+      #   Using setup-trivy + direct CLI invocation instead of trivy-action.
+      #   The trivy-action wrapper ignores --ignore-unfixed for SARIF output,
+      #   causing exit 1 on unfixable Alpine CVEs. Running trivy directly
+      #   fixes this because all CLI flags are fully respected.
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.2
+        with:
+          version: v0.70.0
+
+      # ── 7a. Table scan — informational log, never blocks ──────────────────
       - name: "🔍 Trivy table — ${{ matrix.service }} (CRITICAL+HIGH+MEDIUM)"
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref:      "${{ matrix.service }}:scan-target"
-          format:         table
-          exit-code:      "0"
-          ignore-unfixed: true
-          vuln-type:      "os,library"
-          severity:       "CRITICAL,HIGH,MEDIUM"
-          trivyignores:   ".trivyignore"
+        run: |
+          trivy image \
+            --format table \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --ignorefile .trivyignore \
+            ${{ matrix.service }}:scan-target
 
-      # ── 6b. Trivy SARIF scan — blocks on CRITICAL+FIXED only ───────────────
-      #   ignore-unfixed: true is the key setting that prevents alpine/vendor
-      #   CVEs with no available patch from causing a false exit-1.
-      - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL fixed only)"
+      # ── 7b. SARIF scan — CLI directly, blocks on CRITICAL+FIXED only ──────
+      #   --ignore-unfixed: CVEs with no available patch are skipped
+      #   --exit-code 1:    fail only when a patchable CRITICAL exists
+      #   continue-on-error: allows steps 7c, 8, 9 to run even on failure
+      - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL+fixed only)"
         id: trivy-sarif
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref:      "${{ matrix.service }}:scan-target"
-          format:         sarif
-          output:         "trivy-${{ matrix.service }}.sarif"
-          exit-code:      "1"
-          ignore-unfixed: true
-          vuln-type:      "os,library"
-          severity:       "CRITICAL"
-          trivyignores:   ".trivyignore"
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-${{ matrix.service }}.sarif \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --severity CRITICAL \
+            --ignorefile .trivyignore \
+            ${{ matrix.service }}:scan-target
+        continue-on-error: true   # upload SARIF even if scan failed
 
-      # ── 6c. Trivy JSON — full report, always runs ──────────────────────────
+      # ── 7c. JSON scan — full report, all severities, always runs ──────────
       - name: "🔍 Trivy JSON — ${{ matrix.service }} (all severities)"
-        uses: aquasecurity/trivy-action@master
         if: always()
-        with:
-          image-ref:      "${{ matrix.service }}:scan-target"
-          format:         json
-          output:         "trivy-${{ matrix.service }}.json"
-          exit-code:      "0"
-          ignore-unfixed: false
-          vuln-type:      "os,library"
-          severity:       "CRITICAL,HIGH,MEDIUM,LOW"
-          trivyignores:   ".trivyignore"
+        run: |
+          trivy image \
+            --format json \
+            --output trivy-${{ matrix.service }}.json \
+            --exit-code 0 \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --ignorefile .trivyignore \
+            ${{ matrix.service }}:scan-target
 
-      # ── 7. Upload SARIF to GitHub Security tab ─────────────────────────────
+      # ── 8. Upload SARIF to GitHub Security tab ─────────────────────────────
       - name: Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: "trivy-${{ matrix.service }}.sarif"
-          category:   "trivy-${{ matrix.service }}"
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category:   trivy-${{ matrix.service }}
 
-      # ── 8. Upload JSON report as workflow artifact ──────────────────────────
-      - name: Upload Trivy JSON report artifact
+      # ── 9. Upload JSON as workflow artifact ────────────────────────────────
+      - name: Upload Trivy JSON report
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name:           "trivy-report-${{ matrix.service }}-${{ needs.extract-version.outputs.version }}"
-          path:           "trivy-${{ matrix.service }}.json"
+          path:           trivy-${{ matrix.service }}.json
           retention-days: 30
 
-      # ── 9. Explicit failure gate ───────────────────────────────────────────
-      #   Re-raise failure AFTER the SARIF upload has completed, so findings
-      #   are always visible in the Security tab even when the job fails.
-      - name: "❌ Fail if CRITICAL vulnerabilities found"
+      # ── 10. Explicit fail gate ─────────────────────────────────────────────
+      #   Re-raise the failure AFTER SARIF is uploaded so findings are always
+      #   visible in Security tab regardless of whether the job fails.
+      - name: "❌ Fail if patchable CRITICAL vulnerabilities found"
         if: steps.trivy-sarif.outcome == 'failure'
         run: |
-          echo "❌ Trivy found CRITICAL+FIXED vulnerabilities in ${{ matrix.service }}."
-          echo "   View findings: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
-          echo "   Fix: update the base image or vulnerable package, then re-publish the release."
+          echo "❌ Trivy found patchable CRITICAL vulnerabilities in ${{ matrix.service }}."
+          echo "   Fix: update the base image or the vulnerable package, then re-publish the release."
+          echo "   Details: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
           exit 1
 
-      # ── 10. Push to GHCR — only reached if scan passed ────────────────────
+      # ── 11. Push to GHCR — only reached if scan passed ────────────────────
       - name: Push ${{ matrix.service }} to GHCR
         uses: docker/build-push-action@v5
         with:
@@ -234,7 +242,7 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 3 — trivy-summary
-  # Download all JSON reports and write a consolidated summary table.
+  # Download all JSON reports and publish a consolidated summary table.
   # ────────────────────────────────────────────────────────────────────────────
   trivy-summary:
     name: 📊 Trivy Scan Summary
@@ -252,7 +260,6 @@ jobs:
       - name: Write consolidated Trivy summary
         run: |
           VERSION="${{ needs.extract-version.outputs.version }}"
-
           {
             echo "## 🔍 Trivy Security Scan Summary — ${VERSION}"
             echo ""
@@ -278,15 +285,14 @@ jobs:
             done
 
             echo ""
-            echo "> **Policy:** Blocks on CRITICAL+FIXED only. HIGH/MEDIUM/LOW are reported."
-            echo "> Unfixed CVEs (no available patch) are ignored."
-            echo "> Full JSON reports are available as workflow artifacts (30-day retention)."
-            echo "> Findings are visible in **[Security → Code scanning](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)**."
+            echo "> **Policy:** Blocks on CRITICAL+FIXED only. Unfixed CVEs (no patch available) are ignored."
+            echo "> Full reports available as workflow artifacts (30-day retention)."
+            echo "> Findings: **[Security → Code scanning](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)**"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 4 — package-release
-  # Bundle source + Trivy reports into a ZIP and upload to the Release.
+  # Bundle source + scan reports into a ZIP and upload to the Release.
   # ────────────────────────────────────────────────────────────────────────────
   package-release:
     name: 📦 Package Release Asset
@@ -313,10 +319,9 @@ jobs:
           rsync -a --exclude='node_modules' --exclude='.git' backend/  release/backend/
           rsync -a                                           database/ release/database/
 
-          # Bundle Trivy JSON reports
           if ls trivy-reports/*.json 1>/dev/null 2>&1; then
             cp trivy-reports/*.json release/security/
-            echo "✅ Security reports bundled in release/security/"
+            echo "✅ Trivy reports bundled in release/security/"
           fi
 
           cp docker-compose.yml release/
@@ -334,6 +339,7 @@ jobs:
 
           cat > release/docker-compose.prod.yml <<EOF
           # Production compose — images pulled from GHCR with pinned version tags
+          # Usage: export DB_PASSWORD=secret && docker compose -f docker-compose.prod.yml up -d
           version: "3.9"
           services:
             database:
@@ -402,7 +408,7 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 5 — release-notes
-  # Update GitHub Release body + publish workflow summary.
+  # Update GitHub Release body + write workflow summary.
   # ────────────────────────────────────────────────────────────────────────────
   release-notes:
     name: 📝 Publish Release Notes & Summary
@@ -442,11 +448,11 @@ jobs:
 
             All images scanned with **Trivy** before being pushed to GHCR.
             Full findings: [Security → Code scanning](${secUrl})
-            JSON reports bundled in \`release/security/\` inside the ZIP.
+            JSON reports are bundled in \`release/security/\` inside the ZIP.
 
             | Policy | Action |
             |--------|--------|
-            | CRITICAL + patch available | ❌ Blocks release |
+            | CRITICAL + patch available | ❌ Blocks release — image not pushed |
             | CRITICAL + no patch (unfixed) | ⚠️ Reported, does not block |
             | HIGH / MEDIUM / LOW | ⚠️ Reported, does not block |
 
@@ -473,12 +479,12 @@ jobs:
             ├── frontend/
             ├── backend/
             ├── database/
-            ├── security/                  ← Trivy JSON reports
+            ├── security/                    ← Trivy JSON reports
             │   ├── trivy-frontend.json
             │   ├── trivy-backend.json
             │   └── trivy-database.json
-            ├── docker-compose.yml
-            ├── docker-compose.prod.yml
+            ├── docker-compose.yml           ← Local dev (build from source)
+            ├── docker-compose.prod.yml      ← Production (pull from GHCR)
             ├── README.md
             └── VERSION
             \`\`\`
@@ -502,7 +508,6 @@ jobs:
           VERSION="${{ needs.extract-version.outputs.version }}"
           OWNER="${{ env.IMAGE_OWNER }}"
           REGISTRY="${{ env.REGISTRY }}"
-
           {
             echo "---"
             echo "## ✅ Release ${VERSION} — Published Successfully"
@@ -515,8 +520,8 @@ jobs:
             echo ""
             echo "## 🐳 Docker Images"
             echo ""
-            echo "| Service | Image |"
-            echo "|---------|-------|"
+            echo "| Service  | Image |"
+            echo "|----------|-------|"
             echo "| Frontend | \`${REGISTRY}/${OWNER}/frontend:${VERSION}\` |"
             echo "| Backend  | \`${REGISTRY}/${OWNER}/backend:${VERSION}\` |"
             echo "| Database | \`${REGISTRY}/${OWNER}/database:${VERSION}\` |"
