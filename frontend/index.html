@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Microservices App</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; color: #333; }
+    header { background: #1a73e8; color: white; padding: 1rem 2rem; }
+    header h1 { font-size: 1.5rem; }
+    main { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .card h2 { font-size: 1.1rem; margin-bottom: 1rem; color: #1a73e8; }
+    input, textarea { width: 100%; padding: 0.6rem; border: 1px solid #ddd;
+                      border-radius: 4px; font-size: 0.95rem; margin-bottom: 0.8rem; }
+    button { background: #1a73e8; color: white; border: none; padding: 0.6rem 1.4rem;
+             border-radius: 4px; cursor: pointer; font-size: 0.95rem; }
+    button:hover { background: #1558b0; }
+    #items-list { list-style: none; }
+    #items-list li { padding: 0.6rem 0; border-bottom: 1px solid #eee; display: flex;
+                     justify-content: space-between; align-items: center; }
+    .status { font-size: 0.85rem; padding: 0.3rem 0.7rem; border-radius: 12px; }
+    .status.ok { background: #d4edda; color: #155724; }
+    .status.err { background: #f8d7da; color: #721c24; }
+    #api-status { font-size: 0.85rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <header><h1>🚀 Microservices App</h1></header>
+  <main>
+    <div class="card">
+      <h2>API Health</h2>
+      <button onclick="checkHealth()">Check Backend Status</button>
+      <div id="api-status"></div>
+    </div>
+    <div class="card">
+      <h2>Add Item</h2>
+      <input id="item-name" type="text" placeholder="Item name" />
+      <textarea id="item-desc" rows="2" placeholder="Description"></textarea>
+      <button onclick="addItem()">Add Item</button>
+    </div>
+    <div class="card">
+      <h2>Items List</h2>
+      <button onclick="loadItems()">Refresh</button>
+      <ul id="items-list" style="margin-top:1rem;"></ul>
+    </div>
+  </main>
+  <script>
+    const API = window.API_URL || 'http://localhost:3000';
+
+    async function checkHealth() {
+      const el = document.getElementById('api-status');
+      try {
+        const r = await fetch(`${API}/health`);
+        const d = await r.json();
+        el.innerHTML = `<span class="status ok">✅ ${d.status} — DB: ${d.database}</span>`;
+      } catch (e) {
+        el.innerHTML = `<span class="status err">❌ Backend unreachable</span>`;
+      }
+    }
+
+    async function loadItems() {
+      const ul = document.getElementById('items-list');
+      try {
+        const r = await fetch(`${API}/items`);
+        const items = await r.json();
+        ul.innerHTML = items.length
+          ? items.map(i => `<li><strong>${i.name}</strong><span>${i.description || ''}</span></li>`).join('')
+          : '<li>No items found.</li>';
+      } catch (e) {
+        ul.innerHTML = '<li>Failed to load items.</li>';
+      }
+    }
+
+    async function addItem() {
+      const name = document.getElementById('item-name').value.trim();
+      const description = document.getElementById('item-desc').value.trim();
+      if (!name) { alert('Name is required'); return; }
+      try {
+        await fetch(`${API}/items`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, description })
+        });
+        document.getElementById('item-name').value = '';
+        document.getElementById('item-desc').value = '';
+        loadItems();
+      } catch (e) {
+        alert('Failed to add item.');
+      }
+    }
+
+    checkHealth();
+    loadItems();
+  </script>
+</body>
+</html>

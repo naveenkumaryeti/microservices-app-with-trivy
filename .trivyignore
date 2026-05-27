@@ -1,0 +1,19 @@
+# .trivyignore
+# ──────────────────────────────────────────────────────────────────────────────
+# List CVE IDs here (one per line) to suppress specific Trivy findings.
+#
+# Use this ONLY for:
+#   1. False positives confirmed by your security team
+#   2. Vulnerabilities with no available fix AND accepted risk
+#   3. CVEs that do not apply to your usage of the affected package
+#
+# Format:
+#   CVE-YYYY-NNNNN          # suppress by CVE ID
+#   # comment lines are ignored
+#
+# Example (DO NOT uncomment without security team approval):
+#   CVE-2023-12345          # false positive — not applicable to our build
+#   CVE-2024-99999          # no fix available, accepted risk documented in JIRA-123
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# Add project-specific suppressions below this line:

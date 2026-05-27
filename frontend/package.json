@@ -1,0 +1,11 @@
+{
+  "name": "microservices-frontend",
+  "version": "1.0.0",
+  "description": "Static frontend served by Nginx",
+  "scripts": {
+    "build": "echo 'Static site — no build step required'",
+    "lint": "echo 'No linter configured'"
+  },
+  "keywords": ["frontend", "nginx", "microservices"],
+  "license": "MIT"
+}
