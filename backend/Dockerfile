@@ -6,9 +6,11 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Copy manifests first to leverage Docker layer cache
-COPY package*.json ./
-# Use npm ci if lockfile exists (CI/CD), otherwise fall back to npm install
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+COPY package.json ./
+# Use npm install — lockfile is generated fresh inside the container.
+# This avoids stub/stale package-lock.json sync errors in CI.
+# Once you have a real lockfile committed, replace with: npm ci --omit=dev
+RUN npm install --omit=dev
 
 # ─────────────────────────────────────────────
 # Stage 2: Production image

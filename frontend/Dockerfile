@@ -4,11 +4,9 @@
 FROM node:20-alpine AS builder
 
 WORKDIR /app
-COPY package*.json ./
-# Use npm ci if lockfile present, otherwise npm install (or skip if no package.json)
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; \
-    elif [ -f package.json ]; then npm install --omit=dev; fi
 COPY . .
+# No npm dependencies — pure static HTML/JS served by Nginx.
+# The node builder stage is kept for future build tooling (e.g. Vite/webpack).
 
 # ─────────────────────────────────────────────
 # Stage 2: Production — Nginx static server

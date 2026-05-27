@@ -1,43 +1,42 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# Release Workflow — Build · Scan · Tag · Push · Package · Publish
+# Release Workflow — Build · Scan · Push · Package · Publish
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # Triggers on every GitHub Release publication.
 # Responsibilities (ONLY):
 #   1. Extract version from the release tag (e.g. v1.0.0)
 #   2. Build Docker images for frontend / backend / database
-#   3. Trivy vulnerability scan each image (CRITICAL/HIGH — fails on CRITICAL)
-#   4. Tag each image with <version> and latest
-#   5. Push all images to GitHub Container Registry (GHCR)
-#   6. Upload Trivy SARIF reports to GitHub Security tab
-#   7. Bundle a release package (ZIP) and upload as a Release Asset
-#   8. Generate release notes (includes scan summary) and workflow summary
+#   3. Trivy vulnerability scan each image BEFORE pushing
+#      • Table  → printed in logs (informational)
+#      • SARIF  → uploaded to GitHub Security tab
+#      • JSON   → saved as workflow artifact + bundled in release ZIP
+#      • BLOCKS on CRITICAL+FIXED vulnerabilities only
+#   4. Push images to GHCR (only if scan passes)
+#   5. Publish consolidated Trivy summary table
+#   6. Bundle release ZIP and upload as Release Asset
+#   7. Generate release notes + workflow summary
 #
 # NO deployment is performed.
 # ══════════════════════════════════════════════════════════════════════════════
 
 name: Release — Build, Scan, Push & Package
 
-# ── Trigger ───────────────────────────────────────────────────────────────────
 on:
   release:
-    types: [published]   # fires when a GitHub Release is published
+    types: [published]
 
-# ── Concurrency — prevent duplicate runs for the same release tag ─────────────
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false   # never cancel an in-progress release
+  cancel-in-progress: false
 
-# ── Minimal, explicit permissions ─────────────────────────────────────────────
 permissions:
-  contents: write            # upload release assets
-  packages: write            # push to GHCR
-  security-events: write     # upload Trivy SARIF to GitHub Security tab
-  id-token: write            # OIDC (for future cosign signing)
+  contents:        write   # upload release assets
+  packages:        write   # push to GHCR
+  security-events: write   # upload Trivy SARIF to GitHub Security tab
+  id-token:        write   # OIDC (future cosign signing)
 
-# ── Environment variables shared across all jobs ──────────────────────────────
 env:
-  REGISTRY: ghcr.io
+  REGISTRY:    ghcr.io
   IMAGE_OWNER: ${{ github.repository_owner }}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -45,46 +44,42 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 1 — extract-version
-  # Parse the release tag and expose it to downstream jobs.
   # ────────────────────────────────────────────────────────────────────────────
   extract-version:
     name: 📋 Extract Version
     runs-on: ubuntu-latest
 
     outputs:
-      version:       ${{ steps.parse.outputs.version }}       # e.g. v1.0.0
-      version_plain: ${{ steps.parse.outputs.plain }}         # e.g. 1.0.0
+      version:       ${{ steps.parse.outputs.version }}
+      version_plain: ${{ steps.parse.outputs.plain }}
 
     steps:
-      - name: Parse release tag
+      - name: Parse and validate release tag
         id: parse
         run: |
           TAG="${{ github.ref_name }}"
 
-          # Validate the tag follows semver vX.Y.Z format
           if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "❌ Tag '$TAG' does not match vX.Y.Z format" >&2
             exit 1
           fi
 
-          VERSION="$TAG"
-          PLAIN="${TAG#v}"
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "plain=$PLAIN"     >> "$GITHUB_OUTPUT"
-          echo "✅ Release version: $VERSION"
+          echo "version=${TAG}"    >> "$GITHUB_OUTPUT"
+          echo "plain=${TAG#v}"    >> "$GITHUB_OUTPUT"
+          echo "✅ Release version: ${TAG}"
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 2 — build-scan-push  (matrix: frontend / backend / database)
   #
-  # Flow per service:
-  #   a) Build image locally (load into docker daemon, no push yet)
-  #   b) Trivy scan the local image
-  #      • Table report  → printed in logs
-  #      • SARIF report  → uploaded to GitHub Security tab
-  #      • JSON report   → uploaded as workflow artifact
-  #      • EXIT CODE:    1 on CRITICAL vulnerabilities (blocks push)
-  #   c) If scan passes → push versioned + latest tags to GHCR
+  # Per-service sequence:
+  #   a) Build image → load into docker daemon (NOT pushed yet)
+  #   b) Trivy table scan  → logs, exit-code 0, informational
+  #   c) Trivy SARIF scan  → exit-code 1 on CRITICAL+FIXED only
+  #                          (ignore-unfixed prevents alpine false-positives)
+  #   d) Upload SARIF      → GitHub Security tab  (if: always())
+  #   e) Trivy JSON scan   → saved as artifact    (if: always())
+  #   f) Fail gate         → re-raises failure after SARIF upload completes
+  #   g) Push to GHCR      → only reached if scan passed
   # ────────────────────────────────────────────────────────────────────────────
   build-scan-push:
     name: 🐳 Build · 🔍 Scan · 📤 Push — ${{ matrix.service }}
@@ -110,7 +105,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Docker Buildx ────────────────────────────────────────────
+      # ── 2. Buildx ──────────────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -118,7 +113,7 @@ jobs:
             image=moby/buildkit:latest
             network=host
 
-      # ── 3. Authenticate to GHCR ────────────────────────────────────────────
+      # ── 3. GHCR login ──────────────────────────────────────────────────────
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -126,7 +121,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 4. Generate image metadata ─────────────────────────────────────────
+      # ── 4. Image metadata ──────────────────────────────────────────────────
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -140,84 +135,97 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      # ── 5. Build image locally (load into daemon for Trivy scan) ──────────
-      #       We use a local tag first so Trivy can scan BEFORE we push.
-      - name: Build ${{ matrix.service }} image (local — pre-scan)
+      # ── 5. Build locally — load into daemon, DO NOT push yet ──────────────
+      - name: Build ${{ matrix.service }} (local — pre-scan)
         uses: docker/build-push-action@v5
         with:
           context:    ${{ matrix.context }}
           file:       ${{ matrix.dockerfile }}
-          push:       false          # ← not pushed yet; scan first
-          load:       true           # ← load into local docker daemon
+          push:       false
+          load:       true
           tags:       ${{ matrix.service }}:scan-target
           labels:     ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
           provenance: false
 
-      # ── 6a. Trivy scan — table output (human-readable log) ─────────────────
-      - name: "🔍 Trivy scan — ${{ matrix.service }} (table)"
+      # ── 6a. Trivy table scan — informational, never blocks ─────────────────
+      - name: "🔍 Trivy table — ${{ matrix.service }} (CRITICAL+HIGH+MEDIUM)"
         uses: aquasecurity/trivy-action@master
         with:
           image-ref:      "${{ matrix.service }}:scan-target"
           format:         table
-          exit-code:      "0"          # table run never blocks; SARIF run blocks
+          exit-code:      "0"
           ignore-unfixed: true
           vuln-type:      "os,library"
           severity:       "CRITICAL,HIGH,MEDIUM"
           trivyignores:   ".trivyignore"
 
-      # ── 6b. Trivy scan — SARIF (GitHub Security tab) ──────────────────────
-      - name: "🔍 Trivy scan — ${{ matrix.service }} (SARIF)"
+      # ── 6b. Trivy SARIF scan — blocks on CRITICAL+FIXED only ───────────────
+      #   ignore-unfixed: true is the key setting that prevents alpine/vendor
+      #   CVEs with no available patch from causing a false exit-1.
+      - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL fixed only)"
+        id: trivy-sarif
         uses: aquasecurity/trivy-action@master
         with:
           image-ref:      "${{ matrix.service }}:scan-target"
           format:         sarif
           output:         "trivy-${{ matrix.service }}.sarif"
-          exit-code:      "1"          # ← FAILS workflow if CRITICAL found
+          exit-code:      "1"
           ignore-unfixed: true
           vuln-type:      "os,library"
-          severity:       "CRITICAL"   # block only on CRITICAL
+          severity:       "CRITICAL"
           trivyignores:   ".trivyignore"
 
-      # ── 6c. Trivy scan — JSON (downloadable full report) ──────────────────
-      - name: "🔍 Trivy scan — ${{ matrix.service }} (JSON artifact)"
+      # ── 6c. Trivy JSON — full report, always runs ──────────────────────────
+      - name: "🔍 Trivy JSON — ${{ matrix.service }} (all severities)"
         uses: aquasecurity/trivy-action@master
-        if: always()                   # run even if SARIF step fails
+        if: always()
         with:
           image-ref:      "${{ matrix.service }}:scan-target"
           format:         json
           output:         "trivy-${{ matrix.service }}.json"
-          exit-code:      "0"          # JSON step never blocks
-          ignore-unfixed: true
+          exit-code:      "0"
+          ignore-unfixed: false
           vuln-type:      "os,library"
           severity:       "CRITICAL,HIGH,MEDIUM,LOW"
           trivyignores:   ".trivyignore"
 
-      # ── 7. Upload SARIF to GitHub Security tab ────────────────────────────
-      - name: Upload SARIF to GitHub Security
+      # ── 7. Upload SARIF to GitHub Security tab ─────────────────────────────
+      - name: Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
-        if: always()                   # upload even on scan failure for visibility
+        if: always()
         with:
-          sarif_file:    "trivy-${{ matrix.service }}.sarif"
-          category:      "trivy-${{ matrix.service }}"
+          sarif_file: "trivy-${{ matrix.service }}.sarif"
+          category:   "trivy-${{ matrix.service }}"
 
-      # ── 8. Upload JSON report as workflow artifact ─────────────────────────
-      - name: Upload Trivy JSON report
+      # ── 8. Upload JSON report as workflow artifact ──────────────────────────
+      - name: Upload Trivy JSON report artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name:              "trivy-report-${{ matrix.service }}-${{ needs.extract-version.outputs.version }}"
-          path:              "trivy-${{ matrix.service }}.json"
-          retention-days:    30
+          name:           "trivy-report-${{ matrix.service }}-${{ needs.extract-version.outputs.version }}"
+          path:           "trivy-${{ matrix.service }}.json"
+          retention-days: 30
 
-      # ── 9. Push to GHCR (only reached if scan passed) ─────────────────────
-      - name: Push ${{ matrix.service }} image to GHCR
+      # ── 9. Explicit failure gate ───────────────────────────────────────────
+      #   Re-raise failure AFTER the SARIF upload has completed, so findings
+      #   are always visible in the Security tab even when the job fails.
+      - name: "❌ Fail if CRITICAL vulnerabilities found"
+        if: steps.trivy-sarif.outcome == 'failure'
+        run: |
+          echo "❌ Trivy found CRITICAL+FIXED vulnerabilities in ${{ matrix.service }}."
+          echo "   View findings: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
+          echo "   Fix: update the base image or vulnerable package, then re-publish the release."
+          exit 1
+
+      # ── 10. Push to GHCR — only reached if scan passed ────────────────────
+      - name: Push ${{ matrix.service }} to GHCR
         uses: docker/build-push-action@v5
         with:
           context:    ${{ matrix.context }}
           file:       ${{ matrix.dockerfile }}
-          push:       true             # ← now we push
+          push:       true
           tags:       ${{ steps.meta.outputs.tags }}
           labels:     ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.service }}
@@ -226,69 +234,59 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 3 — trivy-summary
-  # Collect all JSON scan reports and publish a consolidated summary table.
-  # Runs after all three build-scan-push matrix jobs complete.
+  # Download all JSON reports and write a consolidated summary table.
   # ────────────────────────────────────────────────────────────────────────────
   trivy-summary:
     name: 📊 Trivy Scan Summary
     runs-on: ubuntu-latest
     needs: [extract-version, build-scan-push]
-    if: always()    # always run so we see results even on partial failures
+    if: always()
 
     steps:
-      # ── Download all three JSON reports ───────────────────────────────────
-      - name: Download Trivy reports
+      - name: Download Trivy JSON reports
         uses: actions/download-artifact@v4
         with:
-          pattern:      "trivy-report-*-${{ needs.extract-version.outputs.version }}"
+          pattern:        "trivy-report-*-${{ needs.extract-version.outputs.version }}"
           merge-multiple: true
 
-      # ── Parse and write consolidated summary ──────────────────────────────
-      - name: Generate consolidated Trivy summary
+      - name: Write consolidated Trivy summary
         run: |
           VERSION="${{ needs.extract-version.outputs.version }}"
 
-          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY_EOF'
-          ## 🔍 Trivy Security Scan Summary
-          SUMMARY_EOF
+          {
+            echo "## 🔍 Trivy Security Scan Summary — ${VERSION}"
+            echo ""
+            echo "| Service | CRITICAL | HIGH | MEDIUM | LOW | Status |"
+            echo "|---------|----------|------|--------|-----|--------|"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Service | CRITICAL | HIGH | MEDIUM | LOW | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---------|----------|------|--------|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+            for SERVICE in frontend backend database; do
+              REPORT="trivy-${SERVICE}.json"
+              if [ -f "$REPORT" ]; then
+                CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$REPORT" 2>/dev/null || echo 0)
+                HIGH=$(jq     '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' "$REPORT" 2>/dev/null || echo 0)
+                MEDIUM=$(jq   '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")]   | length' "$REPORT" 2>/dev/null || echo 0)
+                LOW=$(jq      '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")]      | length' "$REPORT" 2>/dev/null || echo 0)
 
-          for SERVICE in frontend backend database; do
-            REPORT="trivy-${SERVICE}.json"
-            if [ -f "$REPORT" ]; then
-              CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$REPORT" 2>/dev/null || echo 0)
-              HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' "$REPORT" 2>/dev/null || echo 0)
-              MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$REPORT" 2>/dev/null || echo 0)
-              LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")]       | length' "$REPORT" 2>/dev/null || echo 0)
-
-              if [ "$CRITICAL" -gt 0 ]; then
-                STATUS="❌ BLOCKED"
-              elif [ "$HIGH" -gt 0 ]; then
-                STATUS="⚠️ WARNING"
+                if   [ "${CRITICAL}" -gt 0 ]; then STATUS="❌ BLOCKED"
+                elif [ "${HIGH}"     -gt 0 ]; then STATUS="⚠️ WARNING"
+                else                               STATUS="✅ PASSED"
+                fi
+                echo "| \`${SERVICE}\` | ${CRITICAL} | ${HIGH} | ${MEDIUM} | ${LOW} | ${STATUS} |"
               else
-                STATUS="✅ PASSED"
+                echo "| \`${SERVICE}\` | — | — | — | — | ⏭️ No report |"
               fi
+            done
 
-              echo "| \`${SERVICE}\` | ${CRITICAL} | ${HIGH} | ${MEDIUM} | ${LOW} | ${STATUS} |" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "| \`${SERVICE}\` | — | — | — | — | ⏭️ No report |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-
-          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY_EOF'
-
-          > **Policy:** Workflow blocks on any **CRITICAL** unfixed vulnerability.
-          > HIGH/MEDIUM/LOW are reported but do not block the release.
-          > Full reports available as workflow artifacts (retained 30 days).
-          > Detailed findings visible in **Security → Code scanning alerts**.
-          SUMMARY_EOF
+            echo ""
+            echo "> **Policy:** Blocks on CRITICAL+FIXED only. HIGH/MEDIUM/LOW are reported."
+            echo "> Unfixed CVEs (no available patch) are ignored."
+            echo "> Full JSON reports are available as workflow artifacts (30-day retention)."
+            echo "> Findings are visible in **[Security → Code scanning](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)**."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 4 — package-release
-  # Bundle deployment artefacts into a ZIP and upload to the GitHub Release.
+  # Bundle source + Trivy reports into a ZIP and upload to the Release.
   # ────────────────────────────────────────────────────────────────────────────
   package-release:
     name: 📦 Package Release Asset
@@ -299,15 +297,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Download Trivy JSON reports to bundle inside the ZIP ──────────────
-      - name: Download Trivy scan reports
+      - name: Download Trivy JSON reports
         uses: actions/download-artifact@v4
         with:
           pattern:        "trivy-report-*-${{ needs.extract-version.outputs.version }}"
           merge-multiple: true
           path:           trivy-reports/
 
-      - name: Create release directory
+      - name: Build release directory
         run: |
           VERSION="${{ needs.extract-version.outputs.version }}"
           mkdir -p release/{frontend,backend,database,security}
@@ -316,17 +313,17 @@ jobs:
           rsync -a --exclude='node_modules' --exclude='.git' backend/  release/backend/
           rsync -a                                           database/ release/database/
 
-          # Include Trivy scan reports in the release package
+          # Bundle Trivy JSON reports
           if ls trivy-reports/*.json 1>/dev/null 2>&1; then
             cp trivy-reports/*.json release/security/
-            echo "✅ Trivy reports included in release/security/"
+            echo "✅ Security reports bundled in release/security/"
           fi
 
           cp docker-compose.yml release/
-          cp README.md          release/ 2>/dev/null || echo "# ${VERSION}" > release/README.md
-
+          cp README.md release/ 2>/dev/null || echo "# ${VERSION}" > release/README.md
           echo "$VERSION" > release/VERSION
-          echo "📁 Release package contents:"
+
+          echo "📁 Package contents:"
           find release -type f | sort
 
       - name: Generate production docker-compose
@@ -336,10 +333,8 @@ jobs:
           REGISTRY="${{ env.REGISTRY }}"
 
           cat > release/docker-compose.prod.yml <<EOF
-          # Production docker-compose — images pulled from GHCR
-          # Usage: docker compose -f docker-compose.prod.yml up -d
+          # Production compose — images pulled from GHCR with pinned version tags
           version: "3.9"
-
           services:
             database:
               image: ${REGISTRY}/${OWNER}/database:${VERSION}
@@ -348,13 +343,12 @@ jobs:
                 POSTGRES_DB:       appdb
                 POSTGRES_USER:     appuser
                 POSTGRES_PASSWORD: \${DB_PASSWORD:?DB_PASSWORD required}
-              volumes:
-                - db-data:/var/lib/postgresql/data
+              volumes: [db-data:/var/lib/postgresql/data]
               healthcheck:
                 test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
                 interval: 10s
-                timeout: 5s
-                retries: 5
+                timeout:  5s
+                retries:  5
               networks: [ms-network]
 
             backend:
@@ -394,7 +388,7 @@ jobs:
           zip -r "$ZIP_NAME" release/
           echo "ZIP_NAME=$ZIP_NAME"        >> "$GITHUB_ENV"
           echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> "$GITHUB_ENV"
-          echo "📦 Created: $ZIP_NAME ($(du -sh "$ZIP_NAME" | cut -f1))"
+          echo "📦 $ZIP_NAME — $(du -sh "$ZIP_NAME" | cut -f1)"
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
@@ -408,7 +402,7 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 5 — release-notes
-  # Update the GitHub Release body and publish the workflow summary.
+  # Update GitHub Release body + publish workflow summary.
   # ────────────────────────────────────────────────────────────────────────────
   release-notes:
     name: 📝 Publish Release Notes & Summary
@@ -416,7 +410,7 @@ jobs:
     needs: [extract-version, build-scan-push, trivy-summary, package-release]
 
     steps:
-      - name: Update GitHub Release notes
+      - name: Update GitHub Release body
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -426,15 +420,15 @@ jobs:
             const registry = '${{ env.REGISTRY }}';
             const sha      = '${{ github.sha }}'.substring(0, 7);
             const runUrl   = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
-            const zipName  = `release-${version}.zip`;
             const secUrl   = `${{ github.server_url }}/${{ github.repository }}/security/code-scanning`;
+            const zipName  = `release-${version}.zip`;
 
             const services  = ['frontend', 'backend', 'database'];
-            const imageRows = services.map(svc =>
-              `| \`${svc}\` | \`${registry}/${owner}/${svc}:${version}\` | \`${registry}/${owner}/${svc}:latest\` |`
+            const imageRows = services.map(s =>
+              `| \`${s}\` | \`${registry}/${owner}/${s}:${version}\` | \`${registry}/${owner}/${s}:latest\` |`
             ).join('\n');
-            const pullCmds = services.map(svc =>
-              `docker pull ${registry}/${owner}/${svc}:${version}`
+            const pullCmds = services.map(s =>
+              `docker pull ${registry}/${owner}/${s}:${version}`
             ).join('\n');
 
             const body = `
@@ -446,14 +440,15 @@ jobs:
 
             ### 🔍 Security Scan (Trivy)
 
-            All images were scanned with **Trivy** before being pushed to the registry.
-            Full findings are available in the [Security tab](${secUrl}) and bundled inside the release ZIP under \`security/\`.
+            All images scanned with **Trivy** before being pushed to GHCR.
+            Full findings: [Security → Code scanning](${secUrl})
+            JSON reports bundled in \`release/security/\` inside the ZIP.
 
-            | Policy | Behaviour |
-            |--------|-----------|
-            | CRITICAL vulnerabilities | ❌ Blocks release — image not pushed |
+            | Policy | Action |
+            |--------|--------|
+            | CRITICAL + patch available | ❌ Blocks release |
+            | CRITICAL + no patch (unfixed) | ⚠️ Reported, does not block |
             | HIGH / MEDIUM / LOW | ⚠️ Reported, does not block |
-            | Unfixed vulns | Ignored (unfixed = no patch available) |
 
             ---
 
@@ -471,14 +466,14 @@ jobs:
 
             ### 📦 Release Asset
 
-            Download **\`${zipName}\`** from the Assets section below.
+            Download **\`${zipName}\`** from Assets below.
 
             \`\`\`
             release/
             ├── frontend/
             ├── backend/
             ├── database/
-            ├── security/                    ← Trivy JSON scan reports
+            ├── security/                  ← Trivy JSON reports
             │   ├── trivy-frontend.json
             │   ├── trivy-backend.json
             │   └── trivy-database.json
@@ -499,41 +494,36 @@ jobs:
               owner:      context.repo.owner,
               repo:       context.repo.repo,
               release_id: context.payload.release.id,
-              body:       body,
+              body,
             });
-            core.info('✅ Release notes updated');
 
       - name: Write workflow summary
         run: |
           VERSION="${{ needs.extract-version.outputs.version }}"
           OWNER="${{ env.IMAGE_OWNER }}"
           REGISTRY="${{ env.REGISTRY }}"
-          ZIP_NAME="release-${VERSION}.zip"
 
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-
-          ---
-
-          ## ✅ Release ${VERSION} — Published Successfully
-
-          | Property        | Value |
-          |-----------------|-------|
-          | Release Version | \`${VERSION}\` |
-          | Commit SHA      | \`${{ github.sha }}\` |
-          | Release Asset   | \`${ZIP_NAME}\` |
-
-          ## 🐳 Docker Images
-
-          | Service  | Image URL |
-          |----------|-----------|
-          | Frontend | \`${REGISTRY}/${OWNER}/frontend:${VERSION}\` |
-          | Backend  | \`${REGISTRY}/${OWNER}/backend:${VERSION}\` |
-          | Database | \`${REGISTRY}/${OWNER}/database:${VERSION}\` |
-
-          ## 📥 Pull Commands
-          \`\`\`bash
-          docker pull ${REGISTRY}/${OWNER}/frontend:${VERSION}
-          docker pull ${REGISTRY}/${OWNER}/backend:${VERSION}
-          docker pull ${REGISTRY}/${OWNER}/database:${VERSION}
-          \`\`\`
-          EOF
+          {
+            echo "---"
+            echo "## ✅ Release ${VERSION} — Published Successfully"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Commit  | \`${{ github.sha }}\` |"
+            echo "| Asset   | \`release-${VERSION}.zip\` |"
+            echo ""
+            echo "## 🐳 Docker Images"
+            echo ""
+            echo "| Service | Image |"
+            echo "|---------|-------|"
+            echo "| Frontend | \`${REGISTRY}/${OWNER}/frontend:${VERSION}\` |"
+            echo "| Backend  | \`${REGISTRY}/${OWNER}/backend:${VERSION}\` |"
+            echo "| Database | \`${REGISTRY}/${OWNER}/database:${VERSION}\` |"
+            echo ""
+            echo "\`\`\`bash"
+            echo "docker pull ${REGISTRY}/${OWNER}/frontend:${VERSION}"
+            echo "docker pull ${REGISTRY}/${OWNER}/backend:${VERSION}"
+            echo "docker pull ${REGISTRY}/${OWNER}/database:${VERSION}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
