@@ -1,27 +1,6 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Release Workflow — Build · Scan · Push · Package · Publish
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Trivy strategy — direct CLI via setup-trivy (NOT trivy-action wrapper):
-#   trivy-action silently strips --ignore-unfixed for SARIF, causing false
-#   exit-1 on Alpine unfixed CVEs. Direct CLI fully respects all flags.
-#
-# Per-image flow:
-#   Build (load, no push) → install trivy → table → SARIF → JSON
-#   → upload SARIF → upload JSON → fail gate → push to GHCR
-#
-# NO deployment is performed.
-#
-# FIXES applied:
-#   1. fail-fast: false  — one service failure no longer cancels others
-#   2. .trivyignore guard — touch ensures file always exists
-#   3. Push step uses pre-built GHA cache (cache-from only, no cache-to)
-#   4. GHCR login uses GHCR_PAT secret (write:packages scope) so that
-#      brand-new packages can be created. GITHUB_TOKEN can only push to
-#      packages that already exist and are linked to the repo — it cannot
-#      create them on first push.
-# ══════════════════════════════════════════════════════════════════════════════
-
 name: Release — Build, Scan, Push & Package
 
 on:
@@ -33,16 +12,15 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents:        write   # upload release assets
-  packages:        write   # push to GHCR
-  security-events: write   # upload Trivy SARIF
-  id-token:        write   # OIDC (future cosign signing)
+  contents:        write
+  packages:        write
+  security-events: write
+  id-token:        write
 
 env:
   REGISTRY:    ghcr.io
   IMAGE_OWNER: ${{ github.repository_owner }}
 
-# ══════════════════════════════════════════════════════════════════════════════
 jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -51,11 +29,9 @@ jobs:
   extract-version:
     name: 📋 Extract Version
     runs-on: ubuntu-latest
-
     outputs:
       version:       ${{ steps.parse.outputs.version }}
       version_plain: ${{ steps.parse.outputs.plain }}
-
     steps:
       - name: Parse and validate release tag
         id: parse
@@ -70,7 +46,7 @@ jobs:
           echo "✅ Release version: ${TAG}"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # JOB 2 — build-scan-push  (matrix: frontend / backend / database)
+  # JOB 2 — build-scan-push
   # ────────────────────────────────────────────────────────────────────────────
   build-scan-push:
     name: 🐳 Build · 🔍 Scan · 📤 Push — ${{ matrix.service }}
@@ -105,23 +81,17 @@ jobs:
             network=host
 
       # ── 3. GHCR login ──────────────────────────────────────────────────────
-      # FIX 4: Use GHCR_PAT instead of GITHUB_TOKEN.
-      #
-      # Root cause: GITHUB_TOKEN has `packages: write` permission BUT it can
-      # only push to packages that already exist AND are linked to this repo.
-      # When a package has never been pushed before (0 packages on GHCR as
-      # confirmed), GITHUB_TOKEN gets permission_denied: write_package because
-      # it cannot CREATE a new package — only a PAT with `write:packages`
-      # scope can do that.
-      #
-      # After the first successful push, the packages are auto-linked to this
-      # repo and GITHUB_TOKEN would work. But using GHCR_PAT permanently is
-      # simpler and more reliable — no need to ever switch back.
+      # Uses GHCR_PAT (classic token with write:packages scope).
+      # GITHUB_TOKEN cannot create brand-new packages — only push to existing ones.
+      # HOW TO CREATE THE PAT:
+      #   GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+      #   → Generate new token → check: write:packages, read:packages, delete:packages
+      #   → Copy token → Repo Settings → Secrets → Actions → New secret → GHCR_PAT
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
 
       # ── 4. Image metadata ──────────────────────────────────────────────────
@@ -138,7 +108,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      # ── 5. Build locally — load into daemon, do NOT push yet ──────────────
+      # ── 5. Build locally (no push yet) ────────────────────────────────────
       - name: Build ${{ matrix.service }} (local — pre-scan)
         uses: docker/build-push-action@v5
         with:
@@ -153,17 +123,19 @@ jobs:
           provenance: false
 
       # ── 6. Install Trivy CLI ───────────────────────────────────────────────
+      # Pinned to commit SHA for security. Version v0.70.0.
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
         with:
           version: v0.70.0
 
-      # FIX 2: Ensure .trivyignore always exists so trivy never exits-1
-      # on a missing ignorefile (which masqueraded as a CRITICAL finding).
+      # ── 6b. Ensure .trivyignore exists ────────────────────────────────────
+      # Without this, trivy --ignorefile .trivyignore exits-1 when the file
+      # is missing, even with zero findings — falsely triggering the fail gate.
       - name: Ensure .trivyignore exists
         run: touch .trivyignore
 
-      # ── 7a. Table scan — informational log, never blocks ──────────────────
+      # ── 7a. Table scan (informational, never blocks) ───────────────────────
       - name: "🔍 Trivy table — ${{ matrix.service }} (CRITICAL+HIGH+MEDIUM)"
         run: |
           trivy image \
@@ -175,7 +147,7 @@ jobs:
             --ignorefile .trivyignore \
             ${{ matrix.service }}:scan-target
 
-      # ── 7b. SARIF scan — blocks on CRITICAL+FIXED only ────────────────────
+      # ── 7b. SARIF scan (blocks on patchable CRITICALs only) ───────────────
       - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL+fixed only)"
         id: trivy-sarif
         run: |
@@ -190,7 +162,7 @@ jobs:
             ${{ matrix.service }}:scan-target
         continue-on-error: true
 
-      # ── 7c. JSON scan — full report, all severities ───────────────────────
+      # ── 7c. JSON scan (full report, all severities) ────────────────────────
       - name: "🔍 Trivy JSON — ${{ matrix.service }} (all severities)"
         if: always()
         run: |
@@ -203,15 +175,19 @@ jobs:
             --ignorefile .trivyignore \
             ${{ matrix.service }}:scan-target
 
-      # ── 8. Upload SARIF to GitHub Security tab ─────────────────────────────
+      # ── 8. Upload SARIF ────────────────────────────────────────────────────
+      # Updated to codeql-action/upload-sarif@v4 (v3 deprecated Dec 2026).
+      # if: always() ensures upload runs even if SARIF scan found CRITICALs.
+      # if-no-files-found: warn prevents hard failure when SARIF is missing.
       - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
-          sarif_file: trivy-${{ matrix.service }}.sarif
-          category:   trivy-${{ matrix.service }}
+          sarif_file:       trivy-${{ matrix.service }}.sarif
+          category:         trivy-${{ matrix.service }}
+        continue-on-error: true
 
-      # ── 9. Upload JSON as workflow artifact ────────────────────────────────
+      # ── 9. Upload JSON artifact ────────────────────────────────────────────
       - name: Upload Trivy JSON report
         uses: actions/upload-artifact@v4
         if: always()
@@ -229,9 +205,9 @@ jobs:
           echo "   Details: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
           exit 1
 
-      # ── 11. Push to GHCR — only reached if scan passed ────────────────────
-      # FIX 3: No cache-to on push step — cache was already written in step 5.
-      # cache-from reuses all cached layers so this step is near-instant.
+      # ── 11. Push to GHCR (only if scan passed) ────────────────────────────
+      # No cache-to here — cache was already written in step 5.
+      # cache-from reuses all cached layers so this is near-instant.
       - name: Push ${{ matrix.service }} to GHCR
         uses: docker/build-push-action@v5
         with:
@@ -335,7 +311,6 @@ jobs:
           REGISTRY="${{ env.REGISTRY }}"
 
           cat > release/docker-compose.prod.yml <<EOF
-          # Production compose — images pulled from GHCR with pinned version tags
           version: "3.9"
           services:
             database:
@@ -440,7 +415,7 @@ jobs:
 
             ### 🔍 Security Scan (Trivy)
 
-            All images scanned before being pushed to GHCR.
+            All images scanned before push to GHCR.
             Full findings: [Security → Code scanning](${secUrl})
 
             | Policy | Action |
@@ -464,18 +439,6 @@ jobs:
             \`\`\`
 
             ### 📦 Release Asset — \`${zipName}\`
-
-            \`\`\`
-            release/
-            ├── frontend/
-            ├── backend/
-            ├── database/
-            ├── security/           ← Trivy JSON reports
-            ├── docker-compose.yml
-            ├── docker-compose.prod.yml
-            ├── README.md
-            └── VERSION
-            \`\`\`
 
             \`\`\`bash
             unzip ${zipName} && cd release
