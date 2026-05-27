@@ -11,6 +11,14 @@
 #   → upload SARIF → upload JSON → fail gate → push to GHCR
 #
 # NO deployment is performed.
+#
+# FIXES applied vs previous version:
+#   1. fail-fast: false  — backend failure no longer cancels database job
+#   2. .trivyignore guard — touch ensures file always exists so trivy never
+#      exits-1 on a missing ignorefile (which was masking as a CRITICAL hit)
+#   3. Push step uses pre-built GHA cache (cache-from only, no cache-to on
+#      push step) so the image bytes are identical to the scanned image.
+#   4. packages: write confirmed at workflow level (already correct, kept).
 # ══════════════════════════════════════════════════════════════════════════════
 
 name: Release — Build, Scan, Push & Package
@@ -69,7 +77,9 @@ jobs:
     needs: extract-version
 
     strategy:
-      fail-fast: true
+      # FIX 1: was `true` — caused database job to be cancelled when backend
+      # failed, so database image was never pushed and its report was missing.
+      fail-fast: false
       matrix:
         include:
           - service:    frontend
@@ -132,12 +142,19 @@ jobs:
           provenance: false
 
       # ── 6. Install Trivy CLI ───────────────────────────────────────────────
-      #   Pinned to commit SHA (v0.2.6) for security and reproducibility.
-      #   Ref: https://github.com/aquasecurity/setup-trivy/releases/tag/v0.2.6
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
         with:
           version: v0.70.0
+
+      # FIX 2: Ensure .trivyignore always exists.
+      # If the file is absent, `trivy --ignorefile .trivyignore` exits with
+      # code 1 even when zero vulnerabilities are found. That non-zero exit
+      # was being captured by trivy-sarif's outcome and falsely triggering the
+      # "Fail if patchable CRITICAL" gate — which is why backend (0 CRITICAL)
+      # was still failing the gate.
+      - name: Ensure .trivyignore exists
+        run: touch .trivyignore
 
       # ── 7a. Table scan — informational log, never blocks ──────────────────
       - name: "🔍 Trivy table — ${{ matrix.service }} (CRITICAL+HIGH+MEDIUM)"
@@ -152,9 +169,6 @@ jobs:
             ${{ matrix.service }}:scan-target
 
       # ── 7b. SARIF scan — blocks on CRITICAL+FIXED only ────────────────────
-      #   --ignore-unfixed: skip CVEs with no available patch
-      #   --exit-code 1:    fail only when a patchable CRITICAL exists
-      #   continue-on-error: allows SARIF upload to run even on failure
       - name: "🔍 Trivy SARIF — ${{ matrix.service }} (CRITICAL+fixed only)"
         id: trivy-sarif
         run: |
@@ -200,7 +214,6 @@ jobs:
           retention-days: 30
 
       # ── 10. Fail gate ──────────────────────────────────────────────────────
-      #   Re-raise failure AFTER SARIF upload so findings appear in Security tab
       - name: "❌ Fail if patchable CRITICAL vulnerabilities found"
         if: steps.trivy-sarif.outcome == 'failure'
         run: |
@@ -210,6 +223,11 @@ jobs:
           exit 1
 
       # ── 11. Push to GHCR — only reached if scan passed ────────────────────
+      # FIX 3: cache-to removed from push step. The build cache was already
+      # written in step 5. Re-declaring cache-to here causes buildkit to
+      # attempt a redundant export which can race with GHCR auth and produce
+      # spurious write_package errors on the very first push of a new package.
+      # cache-from is kept so buildkit reuses all cached layers (no rebuild).
       - name: Push ${{ matrix.service }} to GHCR
         uses: docker/build-push-action@v5
         with:
@@ -219,7 +237,6 @@ jobs:
           tags:       ${{ steps.meta.outputs.tags }}
           labels:     ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
           provenance: false
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -269,8 +286,6 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 4 — package-release
-  # Fix: ZIP_NAME and ZIP_PATH written to GITHUB_OUTPUT (not GITHUB_ENV) so
-  # they are accessible across steps reliably.
   # ────────────────────────────────────────────────────────────────────────────
   package-release:
     name: 📦 Package Release Asset
@@ -361,8 +376,6 @@ jobs:
             ms-network:
           EOF
 
-      # Fix for "Context access might be invalid: ZIP_PATH / ZIP_NAME":
-      # Write to GITHUB_OUTPUT with a step id, then reference via steps.<id>.outputs.<name>
       - name: Create release ZIP
         id: zip
         run: |
