@@ -183,8 +183,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
-          sarif_file:       trivy-${{ matrix.service }}.sarif
-          category:         trivy-${{ matrix.service }}
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category:   trivy-${{ matrix.service }}
         continue-on-error: true
 
       # ── 9. Upload JSON artifact ────────────────────────────────────────────
@@ -366,15 +366,17 @@ jobs:
           echo "zip_path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
           echo "📦 ${ZIP_NAME} — $(du -sh "$ZIP_NAME" | cut -f1)"
 
+      # ── FIX: replaced deprecated actions/upload-release-asset@v1 ──────────
+      # The old action required upload_url from github.event.release which is
+      # no longer reliably populated. softprops/action-gh-release@v2 derives
+      # the target release automatically from the triggering event — no
+      # upload_url input needed at all.
       - name: Upload release asset
-        uses: actions/upload-release-asset@v1
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.zip.outputs.zip_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url:         ${{ github.event.release.upload_url }}
-          asset_path:         ${{ steps.zip.outputs.zip_path }}
-          asset_name:         ${{ steps.zip.outputs.zip_name }}
-          asset_content_type: application/zip
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 5 — release-notes
