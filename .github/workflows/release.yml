@@ -6,7 +6,9 @@ name: Release — Build, Scan, Push & Package
 on:
   release:
     types: [published]
-
+  push:
+    tags:
+      - 'v*'
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
